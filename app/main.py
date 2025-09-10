@@ -4,6 +4,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from .ingest import router as ingest_router
 from .search import router as search_router
+from .api.auth import router as auth_router
+from .api.users import router as users_router
+from .api.categories import router as categories_router
+from .api.documents import router as documents_router
 import os
 
 # 创建FastAPI应用
@@ -27,6 +31,12 @@ app.add_middleware(
 # 注册路由
 app.include_router(ingest_router, prefix="/api/v1", tags=["文档入库"])
 app.include_router(search_router, prefix="/api/v1", tags=["搜索检索"])
+
+# 新增的管理系统路由
+app.include_router(auth_router, prefix="/api/auth", tags=["认证"])
+app.include_router(users_router, prefix="/api/users", tags=["用户管理"])
+app.include_router(categories_router, prefix="/api/categories", tags=["分类管理"])
+app.include_router(documents_router, prefix="/api/documents", tags=["文档管理"])
 
 # 健康检查
 @app.get("/", tags=["健康检查"])
@@ -56,9 +66,13 @@ async def health_check():
         
         # 检查Milvus连接
         try:
-            collections = milvus.list_collections()
-            milvus_status = "ok"
-            has_collection = "kb_chunks" in collections
+            if milvus is not None:
+                collections = milvus.list_collections()
+                milvus_status = "ok"
+                has_collection = "kb_chunks" in collections
+            else:
+                milvus_status = "unavailable"
+                has_collection = False
         except Exception as e:
             milvus_status = f"error: {str(e)}"
             has_collection = False
@@ -67,7 +81,7 @@ async def health_check():
         embed_provider = os.getenv("EMBED_PROVIDER", "not_set")
         
         return {
-            "status": "healthy" if mysql_status == "ok" and milvus_status == "ok" else "unhealthy",
+            "status": "healthy" if mysql_status == "ok" else "partial" if mysql_status == "ok" and milvus_status != "ok" else "unhealthy",
             "components": {
                 "mysql": mysql_status,
                 "milvus": milvus_status,

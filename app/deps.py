@@ -21,8 +21,14 @@ MILVUS_TOKEN = os.getenv("MILVUS_TOKEN", None)
 engine = create_engine(DB_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
-# Milvus客户端
-milvus = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
+# Milvus客户端（容错处理）
+try:
+    milvus = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
+    print("[OK] Milvus connection successful")
+except Exception as e:
+    print(f"[WARNING] Milvus connection failed: {e}")
+    print("Document management features will work, but RAG features may be limited")
+    milvus = None
 
 # 依赖注入函数
 def get_db():
@@ -33,4 +39,6 @@ def get_db():
         db.close()
 
 def get_milvus():
+    if milvus is None:
+        raise Exception("Milvus is not available. Please check your Milvus service.")
     return milvus
