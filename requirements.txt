@@ -1,0 +1,26 @@
+# FastAPI和ASGI服务器
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+
+# 数据库
+sqlalchemy>=2.0.23
+pymysql>=1.1.0
+mysql-connector-python>=8.2.0
+
+# 向量数据库
+pymilvus>=2.3.4
+
+# 文本处理
+langchain-text-splitters>=0.0.1
+tiktoken>=0.5.2
+
+# HTTP客户端和重试
+httpx>=0.25.2
+tenacity>=8.2.3
+
+# 数据验证
+pydantic>=2.5.0
+
+# 其他工具
+python-multipart>=0.0.6
+python-dotenv>=1.0.0
