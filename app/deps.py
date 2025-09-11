@@ -4,12 +4,19 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from pymilvus import MilvusClient
 
-# 数据库配置（使用您的阿里云MySQL配置）
-DB_HOST = "rm-bp1ljbjb34n55su6uko.mysql.rds.aliyuncs.com"
-DB_PORT = 3306
-DB_NAME = "markdown_manager"
-DB_USER = "markdown_user"
-DB_PASSWORD = "Syp19960424"
+try:
+    # 优先从 .env 读取（如果主程序未加载）
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
+# 数据库配置（优先读取环境变量）
+DB_HOST = os.getenv("DB_HOST", "rm-bp1ljbjb34n55su6uko.mysql.rds.aliyuncs.com")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_NAME = os.getenv("DB_NAME", "markdown_manager")
+DB_USER = os.getenv("DB_USER", "markdown_user")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "Syp19960424")
 
 DB_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
