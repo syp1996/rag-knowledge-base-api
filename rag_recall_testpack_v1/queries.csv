@@ -1,0 +1,21 @@
+qid,query,lang,target_doc,expected_span,type
+1,电热水壶是否有保温功能？,zh,01_kettle_manual_en.md,does not keep warm,negation
+2,KETTLE-CW-K100 的容量是多少？,zh,01_kettle_manual_en.md,Capacity: 1.7 L,entity
+3,公司周末加班是按几倍算？,zh,02_company_leave_policy_cn.md,周末加班：2 倍,numeric
+4,洛芙莱斯拿过图灵奖吗？,zh,03_bio_ada_lovelace_zh.md,并不是图灵奖得主,negation
+5,麻醉机支持哪些麻醉剂？,zh,04_anesthesia_cn.md,七氟烷 与 异氟烷,list
+6,杭州什么时候气候最舒适？,zh,05_hangzhou_travel_cn.md,3–4 月与 10–11 月,temporal
+7,What is MHA in Transformers?,en,06_transformer_basics_en.md,Multi-Head Attention,acronym
+8,“Enérgico”和“Energético”区别,zh-es,07_marketing_es_faq.md,Enérgico / Energético,bilingual
+9,刘强东 苏超 必须去看 是不是强制？,zh,08_news_jd_su_chao_cn.md,并非要求员工强制观看,myth-bust
+10,Which accessory fits KETTLE-CW-K100?,en,09_prices_table_en.md,Kettle Base Plate; HEPA Filter,table-join
+11,有没有除垢建议？,zh,01_kettle_manual_en.md,Descale monthly,paraphrase
+12,病假需要什么证明,zh,02_company_leave_policy_cn.md,二级医院及以上的诊断证明,policy
+13,Does the kettle auto shut off?,en,01_kettle_manual_en.md,auto shut-off,fact
+14,Transformer 的 FFN 是啥缩写？,zh,06_transformer_basics_en.md,Position-wise Feed-Forward Network,acronym
+15,七氟烷英文怎么说,zh,04_anesthesia_cn.md,Sevoflurane,term
+16,“Abastecimiento original y directo”更好说法？,es-zh,07_marketing_es_faq.md,Abastecimiento directo de fábrica,style
+17,西湖什么时候会限流？,zh,05_hangzhou_travel_cn.md,2025 年 10 月,temporal
+18,Who first programmed for computers?,en,03_bio_ada_lovelace_zh.md,first computer programmer,paraphrase
+19,What is ISO 80601-2-13 about here?,en,04_anesthesia_cn.md,anesthesia system standard,standard
+20,Price of the Sevo Vaporizer Cap,en,09_prices_table_en.md,149.0,numeric

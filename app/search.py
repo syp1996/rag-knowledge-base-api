@@ -17,6 +17,9 @@ class SearchRequest(BaseModel):
     rerank: bool = Field(default=False, description="是否启用重排")
     doc_ids: Optional[List[int]] = Field(default=None, description="限制搜索的文档ID列表")
     score_threshold: float = Field(default=0.0, ge=0.0, le=1.0, description="相似度阈值")
+    per_doc_max: Optional[int] = Field(default=None, ge=1, description="每个文档最多返回的片段数，用于结果多样化")
+    mmr: bool = Field(default=False, description="启用简单的MMR式去冗与多样化（优先不同文档）")
+    min_unique_docs: Optional[int] = Field(default=None, ge=1, description="保证至少覆盖的不同文档数量（两阶段：先保底覆盖，再按分数补齐）")
 
 class SearchResult(BaseModel):
     doc_id: int
@@ -43,6 +46,7 @@ async def search_documents(
     语义检索：使用IVF_FLAT索引和COSINE距离进行向量搜索
     """
     try:
+        # 根据多样化需求，获取更多候选以便后续筛选
         import time
         start_time = time.time()
         
@@ -61,8 +65,13 @@ async def search_documents(
             "params": {"nprobe": req.nprobe}
         }
         
-        # 如果需要重排，获取更多候选结果
-        search_limit = req.top_k * (3 if req.rerank else 1)
+        # 如果需要多样化/重排，获取更多候选结果
+        multiplier = 1
+        if req.rerank:
+            multiplier = max(multiplier, 3)
+        if req.mmr:
+            multiplier = max(multiplier, 3)
+        search_limit = req.top_k * multiplier
         
         hits = milvus_client.search(
             collection_name="kb_chunks",
@@ -142,8 +151,66 @@ async def search_documents(
             # results = await rerank_results(req.query, results)
             pass
         
-        # 8. 截取最终结果
-        final_results = results[:req.top_k]
+        # 8. 结果多样化与去冗处理（两阶段：先保底覆盖不同文档，再按分数补齐）
+        def diversify(results: List[SearchResult], top_k: int, per_doc_max: Optional[int], mmr: bool, min_unique_docs: Optional[int]) -> List[SearchResult]:
+            if not results:
+                return []
+            ranked = results
+            picked: List[SearchResult] = []
+            picked_by_doc: Dict[int, int] = {}
+            # 第一阶段：保证至少覆盖 min_unique_docs 个不同文档
+            if min_unique_docs:
+                seen_docs = set()
+                for r in ranked:
+                    if len(picked) >= top_k:
+                        break
+                    if r.doc_id not in seen_docs:
+                        if per_doc_max is None or picked_by_doc.get(r.doc_id, 0) < per_doc_max:
+                            picked.append(r)
+                            seen_docs.add(r.doc_id)
+                            picked_by_doc[r.doc_id] = picked_by_doc.get(r.doc_id, 0) + 1
+                    if len(seen_docs) >= min_unique_docs:
+                        break
+            # 构建剩余候选
+            remaining = []
+            picked_keys = {(p.doc_id, p.chunk_index) for p in picked}
+            for r in ranked:
+                if (r.doc_id, r.chunk_index) in picked_keys:
+                    continue
+                remaining.append(r)
+            # 文档内限流（对剩余）
+            if per_doc_max is not None and per_doc_max > 0:
+                deduped = []
+                for r in remaining:
+                    cnt = picked_by_doc.get(r.doc_id, 0)
+                    if cnt < per_doc_max:
+                        deduped.append(r)
+                        picked_by_doc[r.doc_id] = cnt + 1
+                remaining = deduped
+            # 如未启用MMR或已做保底覆盖，则按分数补齐
+            if not mmr or min_unique_docs:
+                for r in remaining:
+                    if len(picked) >= top_k:
+                        break
+                    picked.append(r)
+                return picked[:top_k]
+            # 启用MMR：优先覆盖更多doc_id，再按分数补齐
+            from collections import defaultdict, deque
+            perdoc = defaultdict(list)
+            for r in remaining:
+                perdoc[r.doc_id].append(r)
+            for d in perdoc:
+                perdoc[d] = deque(perdoc[d])
+            doc_order = sorted(perdoc.keys(), key=lambda d: perdoc[d][0].score if perdoc[d] else 0.0, reverse=True)
+            while len(picked) < top_k and any(perdoc[d] for d in doc_order):
+                for d in doc_order:
+                    if len(picked) >= top_k:
+                        break
+                    if perdoc[d]:
+                        picked.append(perdoc[d].popleft())
+            return picked[:top_k]
+
+        final_results = diversify(results, req.top_k, req.per_doc_max, req.mmr, req.min_unique_docs)
         
         search_time = round((time.time() - start_time) * 1000, 2)
         
@@ -172,6 +239,8 @@ async def hybrid_search(
         vector_results = await search_documents(req, db, milvus_client)
         
         # 2. MySQL全文搜索（作为补充）
+        # 放大 FULLTEXT 候选以利于多样化
+        _fulltext_limit = req.top_k * (3 if req.mmr else 1)
         fulltext_result = db.execute(sql_text("""
             SELECT d.id, d.title, c.document_id, c.chunk_index, c.content,
                    MATCH(c.content) AGAINST(:query IN NATURAL LANGUAGE MODE) as relevance
@@ -180,7 +249,7 @@ async def hybrid_search(
             WHERE MATCH(c.content) AGAINST(:query IN NATURAL LANGUAGE MODE)
             ORDER BY relevance DESC
             LIMIT :limit
-        """), {"query": req.query, "limit": req.top_k})
+        """), {"query": req.query, "limit": _fulltext_limit})
         
         fulltext_hits = []
         for row in fulltext_result.fetchall():
@@ -216,8 +285,61 @@ async def hybrid_search(
                 combined_results.append(result)
                 seen_chunks.add(chunk_key)
         
-        # 截取最终结果
-        final_results = combined_results[:req.top_k]
+        # 多样化与去冗
+        def diversify(results: List[SearchResult], top_k: int, per_doc_max: Optional[int], mmr: bool, min_unique_docs: Optional[int]) -> List[SearchResult]:
+            if not results:
+                return []
+            ranked = results
+            picked: List[SearchResult] = []
+            picked_by_doc: Dict[int, int] = {}
+            if min_unique_docs:
+                seen_docs = set()
+                for r in ranked:
+                    if len(picked) >= top_k:
+                        break
+                    if r.doc_id not in seen_docs:
+                        if per_doc_max is None or picked_by_doc.get(r.doc_id, 0) < per_doc_max:
+                            picked.append(r)
+                            seen_docs.add(r.doc_id)
+                            picked_by_doc[r.doc_id] = picked_by_doc.get(r.doc_id, 0) + 1
+                    if len(seen_docs) >= min_unique_docs:
+                        break
+            remaining = []
+            picked_keys = {(p.doc_id, p.chunk_index) for p in picked}
+            for r in ranked:
+                if (r.doc_id, r.chunk_index) in picked_keys:
+                    continue
+                remaining.append(r)
+            if per_doc_max is not None and per_doc_max > 0:
+                deduped = []
+                for r in remaining:
+                    cnt = picked_by_doc.get(r.doc_id, 0)
+                    if cnt < per_doc_max:
+                        deduped.append(r)
+                        picked_by_doc[r.doc_id] = cnt + 1
+                remaining = deduped
+            if not mmr or min_unique_docs:
+                for r in remaining:
+                    if len(picked) >= top_k:
+                        break
+                    picked.append(r)
+                return picked[:top_k]
+            from collections import defaultdict, deque
+            perdoc = defaultdict(list)
+            for r in remaining:
+                perdoc[r.doc_id].append(r)
+            for d in perdoc:
+                perdoc[d] = deque(perdoc[d])
+            doc_order = sorted(perdoc.keys(), key=lambda d: perdoc[d][0].score if perdoc[d] else 0.0, reverse=True)
+            while len(picked) < top_k and any(perdoc[d] for d in doc_order):
+                for d in doc_order:
+                    if len(picked) >= top_k:
+                        break
+                    if perdoc[d]:
+                        picked.append(perdoc[d].popleft())
+            return picked[:top_k]
+
+        final_results = diversify(combined_results, req.top_k, req.per_doc_max, req.mmr, req.min_unique_docs)
         
         return SearchResponse(
             query=req.query,

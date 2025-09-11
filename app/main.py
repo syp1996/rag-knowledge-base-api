@@ -1,14 +1,27 @@
 # app/main.py
+import os
+
+# 加载.env文件
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("✅ .env文件加载成功")
+except ImportError:
+    print("⚠️  python-dotenv未安装，跳过.env文件加载")
+except Exception as e:
+    print(f"⚠️  .env文件加载失败: {e}")
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from .ingest import router as ingest_router
 from .search import router as search_router
+from .ask import router as ask_router
+from .ask_stream import router as ask_stream_router
 from .api.auth import router as auth_router
 from .api.users import router as users_router
 from .api.categories import router as categories_router
 from .api.documents import router as documents_router
-import os
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -31,6 +44,8 @@ app.add_middleware(
 # 注册路由
 app.include_router(ingest_router, prefix="/api/v1", tags=["文档入库"])
 app.include_router(search_router, prefix="/api/v1", tags=["搜索检索"])
+app.include_router(ask_router, prefix="/api/v1", tags=["RAG问答"])
+app.include_router(ask_stream_router, prefix="/api/v1", tags=["RAG问答"])
 
 # 新增的管理系统路由
 app.include_router(auth_router, prefix="/api/auth", tags=["认证"])

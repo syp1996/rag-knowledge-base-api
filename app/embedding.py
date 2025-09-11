@@ -3,7 +3,7 @@ import os, httpx
 from typing import List
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 
-PROVIDER = os.getenv("EMBED_PROVIDER", "cohere")
+PROVIDER = os.getenv("EMBED_PROVIDER", "dashscope")
 
 # 测试模式：返回模拟向量
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
@@ -55,6 +55,18 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
             r = await client.post(url, headers=headers, json={"model": model, "input": texts})
             r.raise_for_status()
             return [d["embedding"] for d in r.json()["data"]]
+
+    if PROVIDER == "dashscope":
+        # 阿里云DashScope text-embedding-v4
+        base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        url = f"{base_url}/embeddings"
+        headers = {"Authorization": f"Bearer {os.getenv('DASHSCOPE_API_KEY', 'sk-279e04bee3d94a61884fd0c3969cf230')}"}
+        model = os.getenv("DASHSCOPE_EMBED_MODEL", "text-embedding-v4")
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, headers=headers, json={"model": model, "input": texts})
+            r.raise_for_status()
+            data = r.json()["data"]
+            return [d["embedding"] for d in data]
 
     raise ValueError(f"Unsupported embedding provider: {PROVIDER}")
 

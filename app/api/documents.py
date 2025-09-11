@@ -38,9 +38,7 @@ async def get_documents(
     category_id: Optional[int] = Query(None, description="分类过滤"),
     db: Session = Depends(get_db)
 ):
-    """获取文档列表"""
-    offset = (page - 1) * per_page
-    
+    """获取文档列表（不分页，返回全部）"""
     # 基础查询（过滤软删除）
     query = db.query(Document).filter(Document.deleted_at.is_(None))
     
@@ -55,21 +53,16 @@ async def get_documents(
     # 排序：置顶文档在前，然后按创建时间倒序
     query = query.order_by(Document.is_pinned.desc(), Document.created_at.desc())
     
-    # 获取总数
-    total = query.count()
-    
-    # 分页
-    documents = query.offset(offset).limit(per_page).all()
-    
-    # 计算总页数
-    pages = (total + per_page - 1) // per_page
+    # 不分页：直接取全部
+    documents = query.all()
+    total = len(documents)
     
     return DocumentList(
         documents=documents,
         total=total,
-        page=page,
-        per_page=per_page,
-        pages=pages
+        page=1,
+        per_page=total,
+        pages=1
     )
 
 @router.post("/", response_model=DocumentSchema)

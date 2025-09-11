@@ -4,7 +4,10 @@
       "Bash(mysql:*)",
       "Bash(where mysql)",
       "Bash(curl.exe:*)",
-      "Bash(python test:*)"
+      "Bash(python test:*)",
+      "Bash(export TEST_MODE=true)",
+      "Bash(uvicorn:*)",
+      "Bash(python:*)"
     ],
     "deny": [],
     "ask": []
