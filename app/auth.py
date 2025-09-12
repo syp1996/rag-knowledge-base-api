@@ -40,7 +40,10 @@ def get_user_by_email(db: Session, email: str):
 
 def authenticate_user(db: Session, username: str, password: str):
     """验证用户"""
+    # 允许用用户名或邮箱登录
     user = get_user_by_username(db, username)
+    if not user:
+        user = get_user_by_email(db, username)
     if not user:
         return False
     if not user.check_password(password):

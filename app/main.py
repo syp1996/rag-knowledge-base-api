@@ -140,6 +140,27 @@ async def startup_event():
         print("All required environment variables are set")
     
     print("API startup completed")
+    # 启动时进行管理员账户自举（仅当无任何用户时）
+    try:
+        from .deps import SessionLocal
+        from .models import User
+        db = SessionLocal()
+        try:
+            existing = db.query(User).count()
+            if existing == 0:
+                admin_username = os.getenv("ADMIN_USERNAME", "admin")
+                admin_email = os.getenv("ADMIN_EMAIL", "admin@example.com")
+                admin_password = os.getenv("ADMIN_PASSWORD", "admin123")
+
+                admin = User(username=admin_username, email=admin_email, is_admin=True)
+                admin.set_password(admin_password)
+                db.add(admin)
+                db.commit()
+                print(f"[BOOTSTRAP] Created initial admin user: {admin_username} / {admin_password}")
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[BOOTSTRAP] Skipped creating initial admin user: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
