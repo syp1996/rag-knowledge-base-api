@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text as sql_text
 from .deps import get_db, get_milvus
 from .embedding import embed_query
+from .rerank import rerank_texts
 from typing import List, Optional, Dict, Any
 import json
 
@@ -14,7 +15,7 @@ class SearchRequest(BaseModel):
     query: str = Field(..., description="搜索查询文本")
     top_k: int = Field(default=8, ge=1, le=50, description="返回结果数量")
     nprobe: int = Field(default=16, ge=1, le=256, description="IVF_FLAT 搜索参数")
-    rerank: bool = Field(default=False, description="是否启用重排")
+    rerank: bool = Field(default=True, description="是否启用重排")
     doc_ids: Optional[List[int]] = Field(default=None, description="限制搜索的文档ID列表")
     score_threshold: float = Field(default=0.0, ge=0.0, le=1.0, description="相似度阈值")
     per_doc_max: Optional[int] = Field(default=None, ge=1, description="每个文档最多返回的片段数，用于结果多样化")
@@ -145,11 +146,21 @@ async def search_documents(
             )
             results.append(result)
         
-        # 7. 可选：重排序（此处简化，实际可集成Cohere/Voyage Rerank API）
-        if req.rerank:
-            # 这里可以添加重排序逻辑
-            # results = await rerank_results(req.query, results)
-            pass
+        # 7. 可选：重排序（基于外部Rerank服务，如阿里云百炼/DashScope）
+        if req.rerank and results:
+            try:
+                texts = [ (r.content or r.preview or "")[:2048] for r in results ]
+                order = await rerank_texts(req.query, texts, top_n=len(texts))
+                # order: list[(index, score)] over original results
+                ordered = [results[idx] for idx, _ in order if 0 <= idx < len(results)]
+                # 保留重排分数到metadata
+                for (idx, score), item in zip(order, ordered):
+                    item.metadata = item.metadata or {}
+                    item.metadata["rerank_score"] = score
+                results = ordered
+            except Exception as e:
+                # 保底不影响主流程
+                print(f"Rerank failed: {e}")
         
         # 8. 结果多样化与去冗处理（两阶段：先保底覆盖不同文档，再按分数补齐）
         def diversify(results: List[SearchResult], top_k: int, per_doc_max: Optional[int], mmr: bool, min_unique_docs: Optional[int]) -> List[SearchResult]:
@@ -285,6 +296,19 @@ async def hybrid_search(
                 combined_results.append(result)
                 seen_chunks.add(chunk_key)
         
+        # 3.5 可选重排序（在合并后统一重排）
+        if req.rerank and combined_results:
+            try:
+                texts = [ (r.content or r.preview or "")[:2048] for r in combined_results ]
+                order = await rerank_texts(req.query, texts, top_n=len(texts))
+                ordered = [combined_results[idx] for idx, _ in order if 0 <= idx < len(combined_results)]
+                for (idx, score), item in zip(order, ordered):
+                    item.metadata = item.metadata or {}
+                    item.metadata["rerank_score"] = score
+                combined_results = ordered
+            except Exception as e:
+                print(f"Hybrid rerank failed: {e}")
+
         # 多样化与去冗
         def diversify(results: List[SearchResult], top_k: int, per_doc_max: Optional[int], mmr: bool, min_unique_docs: Optional[int]) -> List[SearchResult]:
             if not results:

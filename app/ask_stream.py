@@ -5,6 +5,7 @@ import httpx, json, os
 from .deps import milvus
 from .embedding import embed_texts
 from .ask import build_context, MAX_CONTEXT_TOKENS
+from .rerank import rerank_texts
 
 router = APIRouter()
 
@@ -41,9 +42,19 @@ async def ask_stream(req: AskStreamReq):
                 "text": str(h["entity"]["text"]),
                 "similarity": similarity
             })
-    
+
     if not candidates:
         raise HTTPException(status_code=404, detail=f"未找到相似度高于{req.similarity_threshold}的相关片段")
+
+    # 可选：重排候选（通过环境变量 ASK_USE_RERANK 控制）
+    try:
+        import os as _os
+        if _os.getenv("ASK_USE_RERANK", "false").lower() == "true" and candidates:
+            texts = [c["text"][:2048] for c in candidates]
+            order = await rerank_texts(req.message, texts, top_n=len(texts))
+            candidates = [candidates[idx] for idx, _ in order if 0 <= idx < len(candidates)]
+    except Exception as e:
+        print(f"Ask stream rerank failed: {e}")
 
     context = build_context(candidates, budget_tokens=MAX_CONTEXT_TOKENS)
 

@@ -399,7 +399,8 @@ async def ingest_status(
                     collection_name="kb_chunks",
                     filter=f"doc_id == {doc_id}",
                     output_fields=["doc_id"],
-                    limit=200000
+                    # Milvus has a max (offset+limit) window of 16384
+                    limit=16384
                 )
                 vectors_cnt = len(res) if isinstance(res, list) else 0
             except Exception:
@@ -489,7 +490,8 @@ async def reindex_missing(
                         collection_name="kb_chunks",
                         filter=f"doc_id == {doc_id}",
                         output_fields=["doc_id"],
-                        limit=200000
+                        # Milvus has a max (offset+limit) window of 16384
+                        limit=16384
                     )
                     vectors_cnt = len(res) if isinstance(res, list) else 0
                     if vectors_cnt != chunks_cnt:
