@@ -57,13 +57,25 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
             return [d["embedding"] for d in r.json()["data"]]
 
     if PROVIDER == "dashscope":
-        # 阿里云DashScope text-embedding-v4
+        # 阿里云DashScope text-embedding-v4（OpenAI兼容模式）
         base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
         url = f"{base_url}/embeddings"
-        headers = {"Authorization": f"Bearer {os.getenv('DASHSCOPE_API_KEY', 'sk-279e04bee3d94a61884fd0c3969cf230')}"}
+        api_key = os.getenv('DASHSCOPE_API_KEY')
+        if not api_key:
+            raise RuntimeError("Missing DASHSCOPE_API_KEY for dashscope embedding")
+        headers = {"Authorization": f"Bearer {api_key}"}
         model = os.getenv("DASHSCOPE_EMBED_MODEL", "text-embedding-v4")
+        # 可选参数：维度、编码格式
+        payload = {"model": model, "input": texts}
+        try:
+            dim = int(os.getenv("EMBED_DIM", "0"))
+            if dim > 0:
+                payload["dimensions"] = dim
+        except Exception:
+            pass
+        payload["encoding_format"] = "float"
         async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(url, headers=headers, json={"model": model, "input": texts})
+            r = await client.post(url, headers=headers, json=payload)
             r.raise_for_status()
             data = r.json()["data"]
             return [d["embedding"] for d in data]

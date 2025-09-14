@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from typing import Optional, List
 import httpx, json, os
 from .deps import milvus
 from .embedding import embed_texts
@@ -12,10 +13,18 @@ router = APIRouter()
 class AskStreamReq(BaseModel):
     message: str  # 前端使用message而不是query
     top_k: int = 5
-    similarity_threshold: float = 0.3
+    nprobe: int = 16
+    # 二选一使用：保留向后兼容
+    similarity_threshold: float = 0.0  # 若>0则以相似度(1-distance)过滤
+    score_threshold: float = 0.0       # 若>0则以COSINE分数(distance)过滤
+    per_doc_max: Optional[int] = Field(default=None, ge=1)
+    mmr: bool = False
+    min_unique_docs: Optional[int] = Field(default=None, ge=1)
+    rerank: Optional[bool] = None
     use_knowledge_base: bool = True
-    user_llm_api_key: str = Field(default="sk-d946f7d6c6a54aa198a066623f68f8a4", min_length=10)
-    llm_model: str = "deepseek-chat"
+    # 可从请求透传；若不传，则回退到环境变量 DEEPSEEK_API_KEY
+    user_llm_api_key: Optional[str] = None
+    llm_model: str = os.getenv("DEEPSEEK_LLM_MODEL", "deepseek-reasoner")
 
 @router.post("/ask/stream")
 async def ask_stream(req: AskStreamReq):
@@ -23,23 +32,36 @@ async def ask_stream(req: AskStreamReq):
         raise HTTPException(status_code=400, detail="知识库模式未启用")
     
     qv = (await embed_texts([req.message]))[0]
+    # 根据多样化/重排放大候选
+    multiplier = 1
+    _do_rerank = (os.getenv("ASK_USE_RERANK", "false").lower() == "true") if (req.rerank is None) else bool(req.rerank)
+    if _do_rerank:
+        multiplier = max(multiplier, 3)
+    if req.mmr:
+        multiplier = max(multiplier, 3)
+    search_limit = req.top_k * multiplier
+
     hits = milvus.search(
         collection_name="kb_chunks",
         data=[qv],
         anns_field="vector",
-        limit=req.top_k,
-        search_params={"metric_type":"COSINE","params":{"nprobe": 16}},
+        limit=search_limit,
+        search_params={"metric_type":"COSINE","params":{"nprobe": req.nprobe}},
         output_fields=["doc_id","chunk_index","text"]
     )[0]
-    # 过滤相似度阈值并转换为相似度（1 - distance）
+    # 过滤（支持 similarity 或 score 两种阈值）
     candidates = []
     for h in hits:
-        similarity = 1 - h["distance"]  # Milvus返回的是distance，转换为similarity
-        if similarity >= req.similarity_threshold:
+        score = float(h["distance"])         # COSINE 分数（越大越相似）
+        similarity = 1.0 - score              # 兼容旧字段
+        pass_score = (req.score_threshold > 0 and score >= req.score_threshold)
+        pass_sim = (req.similarity_threshold > 0 and similarity >= req.similarity_threshold)
+        if (req.score_threshold > 0 and pass_score) or (req.score_threshold <= 0 and (req.similarity_threshold <= 0 or pass_sim)):
             candidates.append({
                 "doc_id": int(h["entity"]["doc_id"]),
                 "chunk_index": int(h["entity"]["chunk_index"]),
                 "text": str(h["entity"]["text"]),
+                "score": score,
                 "similarity": similarity
             })
 
@@ -49,20 +71,80 @@ async def ask_stream(req: AskStreamReq):
     # 可选：重排候选（通过环境变量 ASK_USE_RERANK 控制）
     try:
         import os as _os
-        if _os.getenv("ASK_USE_RERANK", "false").lower() == "true" and candidates:
+        if _do_rerank and candidates:
             texts = [c["text"][:2048] for c in candidates]
             order = await rerank_texts(req.message, texts, top_n=len(texts))
             candidates = [candidates[idx] for idx, _ in order if 0 <= idx < len(candidates)]
     except Exception as e:
         print(f"Ask stream rerank failed: {e}")
 
-    context = build_context(candidates, budget_tokens=MAX_CONTEXT_TOKENS)
+    # 多样化处理
+    def diversify(results, top_k, per_doc_max, mmr, min_unique_docs):
+        if not results:
+            return []
+        ranked = results
+        picked = []
+        picked_by_doc = {}
+        if min_unique_docs:
+            seen_docs = set()
+            for r in ranked:
+                if len(picked) >= top_k:
+                    break
+                if r["doc_id"] not in seen_docs:
+                    if per_doc_max is None or picked_by_doc.get(r["doc_id"], 0) < per_doc_max:
+                        picked.append(r)
+                        seen_docs.add(r["doc_id"])
+                        picked_by_doc[r["doc_id"]] = picked_by_doc.get(r["doc_id"], 0) + 1
+                if len(seen_docs) >= min_unique_docs:
+                    break
+        remaining = []
+        picked_keys = {(p["doc_id"], p["chunk_index"]) for p in picked}
+        for r in ranked:
+            if (r["doc_id"], r["chunk_index"]) in picked_keys:
+                continue
+            remaining.append(r)
+        if per_doc_max is not None and per_doc_max > 0:
+            deduped = []
+            for r in remaining:
+                cnt = picked_by_doc.get(r["doc_id"], 0)
+                if cnt < per_doc_max:
+                    deduped.append(r)
+                    picked_by_doc[r["doc_id"]] = cnt + 1
+            remaining = deduped
+        if not mmr or min_unique_docs:
+            for r in remaining:
+                if len(picked) >= top_k:
+                    break
+                picked.append(r)
+            return picked[:top_k]
+        from collections import defaultdict, deque
+        perdoc = defaultdict(list)
+        for r in remaining:
+            perdoc[r["doc_id"]].append(r)
+        for d in perdoc:
+            perdoc[d] = deque(perdoc[d])
+        doc_order = sorted(perdoc.keys(), key=lambda d: perdoc[d][0]["score"] if perdoc[d] else 0.0, reverse=True)
+        while len(picked) < top_k and any(perdoc[d] for d in doc_order):
+            for d in doc_order:
+                if len(picked) >= top_k:
+                    break
+                if perdoc[d]:
+                    picked.append(perdoc[d].popleft())
+        return picked[:top_k]
+
+    final_candidates = diversify(candidates, req.top_k, req.per_doc_max, req.mmr, req.min_unique_docs)
+
+    context = build_context(final_candidates, budget_tokens=MAX_CONTEXT_TOKENS)
 
     system_prompt = "你是专业的知识库助理。仅依据'上下文'回答问题；不足则直说。"
     user_prompt = f"问题：{req.message}\n\n上下文：\n{context}"
 
+    _api_key = req.user_llm_api_key or os.getenv("DEEPSEEK_API_KEY")
+    if not _api_key or len(_api_key) < 10:
+        raise HTTPException(status_code=400, detail="DeepSeek API Key 未提供或不合法（请在请求中传 user_llm_api_key 或配置环境变量 DEEPSEEK_API_KEY）")
+
     headers = {
-        "Authorization": f"Bearer {req.user_llm_api_key}",
+        "Authorization": f"Bearer {_api_key}",
         "Content-Type": "application/json",
     }
     payload = {

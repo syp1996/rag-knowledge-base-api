@@ -17,6 +17,7 @@ tiktoken>=0.5.2
 # HTTP客户端和重试
 httpx>=0.25.2
 tenacity>=8.2.3
+dashscope>=1.16.0
 
 # 数据验证
 pydantic>=2.5.0

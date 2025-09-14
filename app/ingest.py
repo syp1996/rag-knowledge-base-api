@@ -12,6 +12,7 @@ from typing import Optional, List, Union, Any, Tuple
 from pydantic import BaseModel
 from .models import Document
 from .utils import get_or_create_default_user, generate_unique_slug
+import os
 
 router = APIRouter()
 
@@ -63,6 +64,36 @@ class IngestTextRequest(BaseModel):
     title: Optional[str] = None
     content: Optional[Union[str, ContentPayload]] = None
     tags: Optional[List[str]] = None
+    # 可选切块参数（不传则使用环境变量）
+    chunk_size: Optional[int] = None
+    chunk_overlap: Optional[int] = None
+
+
+def _env_chunk_params() -> tuple[int, int]:
+    """从环境读取切块参数，带默认与边界保护。"""
+    try:
+        size = int(os.getenv("CHUNK_SIZE", "500"))
+    except Exception:
+        size = 500
+    try:
+        overlap = int(os.getenv("CHUNK_OVERLAP", "120"))
+    except Exception:
+        overlap = 120
+    if size <= 0:
+        size = 500
+    if overlap < 0:
+        overlap = 0
+    if overlap >= size:
+        overlap = max(0, size // 4)
+    return size, overlap
+
+
+def _make_splitter(chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSplitter:
+    return RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", " ", ""]
+    )
 
 
 @router.post("/ingest/text")
@@ -106,11 +137,10 @@ async def ingest_text_document(
         # 若内容为空，则先创建“草稿”文档，跳过切块与向量化，由后续更新接口完成
         do_embedding = len(raw_text) > 0
         if do_embedding:
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=500,
-                chunk_overlap=120,
-                separators=["\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", " ", ""]
-            )
+            env_size, env_overlap = _env_chunk_params()
+            csize = int(payload.chunk_size) if payload.chunk_size else env_size
+            cover = int(payload.chunk_overlap) if payload.chunk_overlap else env_overlap
+            splitter = _make_splitter(csize, cover)
             chunks = splitter.split_text(raw_text)
             if not chunks:
                 raise HTTPException(status_code=400, detail="No chunks generated from content")
@@ -192,6 +222,9 @@ async def ingest_text_document(
 class UpdateTextRequest(BaseModel):
     title: Optional[str] = None
     content: Optional[Union[str, ContentPayload]] = None
+    # 可选切块参数（不传则使用环境）
+    chunk_size: Optional[int] = None
+    chunk_overlap: Optional[int] = None
 
 
 @router.put("/ingest/text/{document_id}")
@@ -305,11 +338,10 @@ async def update_text_document(
         db.commit()
 
         # 重新切分与嵌入
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=120,
-            separators=["\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", " ", ""]
-        )
+        env_size, env_overlap = _env_chunk_params()
+        csize = int(payload.chunk_size) if payload.chunk_size else env_size
+        cover = int(payload.chunk_overlap) if payload.chunk_overlap else env_overlap
+        splitter = _make_splitter(csize, cover)
         chunks = splitter.split_text(raw_text)
         if not chunks:
             raise HTTPException(status_code=400, detail="No chunks generated from content")
@@ -552,12 +584,9 @@ async def reindex_missing(
             s = str(content_obj)
             return s.strip(), {"markdown": s}
 
-        # 切块器
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=120,
-            separators=["\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", " ", ""]
-        )
+        # 切块器（使用环境参数）
+        env_size, env_overlap = _env_chunk_params()
+        splitter = _make_splitter(env_size, env_overlap)
 
         async def embed_in_batches(texts, batch_size: int = 10, delay: float = 0.3):
             vectors_all = []
@@ -670,6 +699,9 @@ async def ingest_document(
     file: UploadFile = File(...),
     title: str = Form(None),
     tags: str = Form(None),
+    # 可选：覆盖切块参数
+    chunk_size: Optional[int] = Form(default=None),
+    chunk_overlap: Optional[int] = Form(default=None),
     db: Session = Depends(get_db),
     milvus_client = Depends(get_milvus)
 ):
@@ -685,11 +717,10 @@ async def ingest_document(
             raise HTTPException(status_code=400, detail="File is empty or cannot be decoded")
         
         # 文本切分
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=120,
-            separators=["\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", " ", ""]
-        )
+        env_size, env_overlap = _env_chunk_params()
+        csize = int(chunk_size) if chunk_size else env_size
+        cover = int(chunk_overlap) if chunk_overlap else env_overlap
+        splitter = _make_splitter(csize, cover)
         chunks = splitter.split_text(raw_text)
         
         if not chunks:
