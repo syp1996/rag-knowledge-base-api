@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from .ask import MAX_CONTEXT_TOKENS, build_context
+from .ask import MAX_CONTEXT_TOKENS, build_context, get_rag_prompts
 from .deps import milvus
 from .embedding import embed_texts
 from .rerank import rerank_texts
@@ -139,9 +139,7 @@ async def ask_stream(req: AskStreamReq):
     final_candidates = diversify(candidates, req.top_k, req.per_doc_max, req.mmr, req.min_unique_docs)
 
     context = build_context(final_candidates, budget_tokens=MAX_CONTEXT_TOKENS)
-
-    system_prompt = "你是专业的知识库助理。仅依据'上下文'回答问题；不足则直说。"
-    user_prompt = f"问题：{req.message}\n\n上下文：\n{context}"
+    system_prompt, user_prompt = get_rag_prompts(req.message, context)
 
     _api_key = req.user_llm_api_key or os.getenv("DEEPSEEK_API_KEY")
     if not _api_key or len(_api_key) < 10:

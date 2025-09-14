@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 import os, httpx
 from .deps import milvus
 from .embedding import embed_texts
@@ -31,6 +31,36 @@ def build_context(chunks: List[dict], budget_tokens=MAX_CONTEXT_TOKENS) -> str:
         pieces.append(f"[doc_id={c['doc_id']}, chunk_index={c['chunk_index']}]\n{txt}")
         used += t
     return "\n\n---\n\n".join(pieces)
+
+
+def get_rag_prompts(query: str, context: str) -> Tuple[str, str]:
+    """构造面向 RAG 的 System/User Prompt。
+    优先读取环境变量覆盖：
+      - RAG_SYSTEM_PROMPT: 专家型角色与输出基调
+      - RAG_USER_INSTRUCTIONS: 写作规范/结构化要求
+    """
+    default_system = (
+        "你是专业领域的中文写作与知识整合助手。请优先基于提供的‘上下文’信息进行事实与依据的组织与表达；"
+        "你可以补充通用的行业常识或背景以帮助理解，但涉及定义、数据、结论与引用时必须以‘上下文’为准。"
+        "若上下文未覆盖某点，请明确说明‘上下文未涉及’，避免臆造。写作要求：用词专业、逻辑清晰、段落结构合理、避免口语化；"
+        "先结论与概要，再层次化展开；关键结论和观点尽量给出上下文中的出处标识。"
+    )
+    default_instructions = (
+        "- 先用1–2段给出总体结论与核心答案\n"
+        "- 随后分要点分段说明，必要时做小标题\n"
+        "- 合理补充通用常识以提升可读性，但不覆盖上下文事实\n"
+        "- 若使用了上下文中的具体事实/定义/数据，请在段末用‘引用：[doc_id=..., chunk=...]’注明\n"
+        "- 语言风格：正式、专业、简洁，避免无依据推断"
+    )
+    system_prompt = os.getenv("RAG_SYSTEM_PROMPT", default_system)
+    instructions = os.getenv("RAG_USER_INSTRUCTIONS", default_instructions)
+
+    user_prompt = (
+        f"问题：{query}\n\n"
+        f"上下文：\n{context}\n\n"
+        f"写作要求：\n{instructions}"
+    )
+    return system_prompt, user_prompt
 
 class AskReq(BaseModel):
     query: str = Field(..., description="用户问题文本（用于生成答案与向量检索）")
@@ -151,20 +181,9 @@ async def ask(req: AskReq):
 
     final_candidates = diversify(candidates, req.top_k, req.per_doc_max, req.mmr, req.min_unique_docs)
 
-    # 4) 组装上下文
+    # 4) 组装上下文 & Prompt
     context = build_context(final_candidates, budget_tokens=MAX_CONTEXT_TOKENS)
-
-    # 5) DeepSeek Prompt
-    system_prompt = (
-        "你是专业的知识库助理。仅依据'上下文'回答问题；"
-        "若上下文没有答案，请明确说明'未在知识库中找到'。"
-        "回答末尾用'参考片段: [doc_id,chunk_index,...]'列出用到的片段标识。"
-    )
-    user_prompt = (
-        f"问题：{req.query}\n\n"
-        f"上下文：\n{context}\n\n"
-        "要求：\n- 使用上下文事实作答，必要时概括归纳\n- 不要编造。"
-    )
+    system_prompt, user_prompt = get_rag_prompts(req.query, context)
 
     # 6) 调用 DeepSeek Chat Completions
     _api_key = req.user_llm_api_key or os.getenv("DEEPSEEK_API_KEY")
