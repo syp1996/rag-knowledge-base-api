@@ -12,15 +12,39 @@ import json
 router = APIRouter()
 
 class SearchRequest(BaseModel):
-    query: str = Field(..., description="搜索查询文本")
-    top_k: int = Field(default=8, ge=1, le=50, description="返回结果数量")
-    nprobe: int = Field(default=16, ge=1, le=256, description="IVF_FLAT 搜索参数")
-    rerank: bool = Field(default=True, description="是否启用重排")
-    doc_ids: Optional[List[int]] = Field(default=None, description="限制搜索的文档ID列表")
-    score_threshold: float = Field(default=0.0, ge=0.0, le=1.0, description="相似度阈值")
-    per_doc_max: Optional[int] = Field(default=None, ge=1, description="每个文档最多返回的片段数，用于结果多样化")
-    mmr: bool = Field(default=False, description="启用简单的MMR式去冗与多样化（优先不同文档）")
-    min_unique_docs: Optional[int] = Field(default=None, ge=1, description="保证至少覆盖的不同文档数量（两阶段：先保底覆盖，再按分数补齐）")
+    query: str = Field(..., description="搜索查询文本")  # 必填查询词
+    top_k: int = Field(
+        default=8, ge=1, le=50,
+        description="返回结果数量（更大→覆盖更广但可能包含低质结果）"
+    )
+    nprobe: int = Field(
+        default=16, ge=1, le=256,
+        description="Milvus IVF nprobe（更大→召回更广但耗时更高，常用64/96/128）"
+    )
+    rerank: bool = Field(
+        default=True,
+        description="是否启用外部重排（提升排序质量，但会放大候选并增加一次外部调用）"
+    )
+    doc_ids: Optional[List[int]] = Field(
+        default=None,
+        description="限制只在指定文档ID集合内检索（可选）"
+    )
+    score_threshold: float = Field(
+        default=0.0, ge=0.0, le=1.0,
+        description="相似度分数阈值（COSINE，越大越相似；设为0以不过滤）"
+    )
+    per_doc_max: Optional[int] = Field(
+        default=None, ge=1,
+        description="每文档最多返回片段数（用于提升跨文档多样性）"
+    )
+    mmr: bool = Field(
+        default=False,
+        description="启用简单多样化（跨文档轮转）；开启后候选池会放大（top_k×3）"
+    )
+    min_unique_docs: Optional[int] = Field(
+        default=None, ge=1,
+        description="至少覆盖的不同文档数量（两阶段：先保底覆盖，再按分数补齐）"
+    )
 
 class SearchResult(BaseModel):
     doc_id: int

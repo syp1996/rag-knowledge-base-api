@@ -33,19 +33,19 @@ def build_context(chunks: List[dict], budget_tokens=MAX_CONTEXT_TOKENS) -> str:
     return "\n\n---\n\n".join(pieces)
 
 class AskReq(BaseModel):
-    query: str
-    top_k: int = Field(DEFAULT_TOP_K, ge=1, le=50)
-    nprobe: int = Field(16, ge=1, le=4096)
+    query: str = Field(..., description="用户问题文本（用于生成答案与向量检索）")
+    top_k: int = Field(DEFAULT_TOP_K, ge=1, le=50, description="返回片段数量（更大→覆盖更广，可能稍降质量）")
+    nprobe: int = Field(16, ge=1, le=4096, description="Milvus IVF nprobe（更大→召回更广但更慢，常用64/96/128）")
     # 可调检索控制
     score_threshold: float = Field(0.0, ge=0.0, le=1.0, description="相似度/分数阈值（COSINE距离，越大越相似）")
     per_doc_max: Optional[int] = Field(default=None, ge=1, description="每文档最多片段数（提升多样性）")
     mmr: bool = Field(default=False, description="启用简单多样化（跨文档轮转）")
     min_unique_docs: Optional[int] = Field(default=None, ge=1, description="至少覆盖的不同文档数")
-    rerank: Optional[bool] = Field(default=None, description="是否启用外部重排（不传则按环境变量 ASK_USE_RERANK）")
+    rerank: Optional[bool] = Field(default=None, description="是否启用外部重排（不传→按环境变量 ASK_USE_RERANK）")
     # 由前端传入的 DeepSeek API Key（只用于本次请求，不落库）；不传则回退到环境变量
-    user_llm_api_key: Optional[str] = None
+    user_llm_api_key: Optional[str] = Field(default=None, description="可选：覆盖默认 DEEPSEEK_API_KEY，仅用于本次请求")
     # DeepSeek 模型名：常见 deepseek-chat（对话）或 deepseek-reasoner（推理）
-    llm_model: str = Field(default=os.getenv("DEEPSEEK_LLM_MODEL", "deepseek-reasoner"))
+    llm_model: str = Field(default=os.getenv("DEEPSEEK_LLM_MODEL", "deepseek-reasoner"), description="LLM 模型名（默认读取 DEEPSEEK_LLM_MODEL）")
 
 @router.post("/ask")
 async def ask(req: AskReq):

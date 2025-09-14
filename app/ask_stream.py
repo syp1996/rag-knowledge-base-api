@@ -1,30 +1,34 @@
+import json
+import os
+from typing import List, Optional
+
+import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import Optional, List
-import httpx, json, os
+
+from .ask import MAX_CONTEXT_TOKENS, build_context
 from .deps import milvus
 from .embedding import embed_texts
-from .ask import build_context, MAX_CONTEXT_TOKENS
 from .rerank import rerank_texts
 
 router = APIRouter()
 
 class AskStreamReq(BaseModel):
-    message: str  # 前端使用message而不是query
-    top_k: int = 5
-    nprobe: int = 16
+    message: str = Field(..., description="用户问题文本（SSE流式生成）")  # 前端使用message而非query
+    top_k: int = Field(20, ge=1, le=50, description="返回片段数量（更大→覆盖更广，可能稍降质量）")
+    nprobe: int = Field(128, ge=1, le=4096, description="Milvus IVF nprobe（更大→召回更广但更慢，常用64/96/128）")
     # 二选一使用：保留向后兼容
-    similarity_threshold: float = 0.0  # 若>0则以相似度(1-distance)过滤
-    score_threshold: float = 0.0       # 若>0则以COSINE分数(distance)过滤
-    per_doc_max: Optional[int] = Field(default=None, ge=1)
-    mmr: bool = False
-    min_unique_docs: Optional[int] = Field(default=None, ge=1)
-    rerank: Optional[bool] = None
-    use_knowledge_base: bool = True
+    similarity_threshold: float = Field(0.0, ge=0.0, le=1.0, description="相似度阈值=1-score；一般不推荐，建议用 score_threshold")
+    score_threshold: float = Field(0.0, ge=0.0, le=1.0, description="相似度分数阈值（COSINE，越大越相似；设0不过滤）")
+    per_doc_max: Optional[int] = Field(default=None, ge=1, description="每文档最多片段数（提升跨文档多样性）")
+    mmr: bool = Field(False, description="启用简单多样化（跨文档轮转）；开启后候选池会放大（top_k×3）")
+    min_unique_docs: Optional[int] = Field(default=None, ge=1, description="至少覆盖的不同文档数量（两阶段保底+补齐）")
+    rerank: Optional[bool] = Field(True, description="是否启用外部重排（不传→按环境变量 ASK_USE_RERANK）")
+    use_knowledge_base: bool = Field(True, description="是否启用知识库增强（关闭将直接报错）")
     # 可从请求透传；若不传，则回退到环境变量 DEEPSEEK_API_KEY
-    user_llm_api_key: Optional[str] = None
-    llm_model: str = os.getenv("DEEPSEEK_LLM_MODEL", "deepseek-reasoner")
+    user_llm_api_key: Optional[str] = Field(default=None, description="可选：覆盖默认 DEEPSEEK_API_KEY，仅用于本次请求")
+    llm_model: str = Field(default=os.getenv("DEEPSEEK_LLM_MODEL", "deepseek-reasoner"), description="LLM 模型名（默认读取 DEEPSEEK_LLM_MODEL）")
 
 @router.post("/ask/stream")
 async def ask_stream(req: AskStreamReq):
