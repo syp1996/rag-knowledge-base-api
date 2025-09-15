@@ -57,27 +57,42 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
             return [d["embedding"] for d in r.json()["data"]]
 
     if PROVIDER == "dashscope":
-        # 阿里云DashScope text-embedding-v4（OpenAI兼容模式）
+        # 阿里云 DashScope（OpenAI 兼容模式）
         base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
         url = f"{base_url}/embeddings"
         api_key = os.getenv('DASHSCOPE_API_KEY')
         if not api_key:
             raise RuntimeError("Missing DASHSCOPE_API_KEY for dashscope embedding")
-        headers = {"Authorization": f"Bearer {api_key}"}
-        model = os.getenv("DASHSCOPE_EMBED_MODEL", "text-embedding-v4")
-        # 可选参数：维度、编码格式
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        # 默认模型改为更常用的 text-embedding-v1；支持通过环境覆盖
+        model = os.getenv("DASHSCOPE_EMBED_MODEL", "text-embedding-v1")
         payload = {"model": model, "input": texts}
+        # 模型 v4 常配 1024 维；若 EMBED_DIM>0 且模型包含 v4，则传递 dimensions
         try:
             dim = int(os.getenv("EMBED_DIM", "0"))
-            if dim > 0:
+            if dim > 0 and "v4" in model:
                 payload["dimensions"] = dim
         except Exception:
             pass
         payload["encoding_format"] = "float"
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.post(url, headers=headers, json=payload)
-            r.raise_for_status()
-            data = r.json()["data"]
+            if r.status_code >= 400:
+                # 暴露服务端返回，便于排错（模型名、账户配额等）
+                detail = None
+                try:
+                    detail = r.text[:500]
+                except Exception:
+                    pass
+                raise httpx.HTTPStatusError(
+                    f"DashScope embeddings error {r.status_code}: {detail}", request=r.request, response=r
+                )
+            data = r.json().get("data")
+            if not data:
+                raise RuntimeError(f"DashScope embeddings returned empty data: {r.text[:200]}")
             return [d["embedding"] for d in data]
 
     raise ValueError(f"Unsupported embedding provider: {PROVIDER}")

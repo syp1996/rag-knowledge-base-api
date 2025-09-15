@@ -56,7 +56,11 @@ app.include_router(categories_router, prefix="/api/categories", tags=["分类管
 app.include_router(documents_router, prefix="/api/documents", tags=["文档管理"])
 app.include_router(images_router, prefix="/images", tags=["图片管理"])
 
-# Static file serving for uploaded images
+# Static file serving for uploaded images (ensure folder exists)
+try:
+    os.makedirs("uploads", exist_ok=True)
+except Exception:
+    pass
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # 健康检查

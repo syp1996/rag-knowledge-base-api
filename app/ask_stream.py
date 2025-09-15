@@ -160,6 +160,8 @@ async def ask_stream(req: AskStreamReq):
     }
 
     async def event_source():
+        # 立即发送一次心跳，触发浏览器进入流模式
+        yield ":\n\n"
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream("POST", "https://api.deepseek.com/chat/completions",
                                      headers=headers, json=payload) as r:
@@ -167,6 +169,7 @@ async def ask_stream(req: AskStreamReq):
                     yield f"data: {json.dumps({'error':'DeepSeek API Key 无效或权限不足'})}\n\n"
                     return
                 r.raise_for_status()
+                yield ":\n\n"
                 async for line in r.aiter_lines():
                     if not line:
                         continue
@@ -175,6 +178,27 @@ async def ask_stream(req: AskStreamReq):
                         data = line[6:]
                         if data.strip() == "[DONE]":
                             break
-                        yield f"{line}\n"
+                        yield f"{line}\n\n"
 
-    return StreamingResponse(event_source(), media_type="text/event-stream")
+    sse_headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(event_source(), media_type="text/event-stream", headers=sse_headers)
+
+@router.get("/ask/echo")
+async def ask_echo():
+    import asyncio
+    async def gen():
+        yield ":\n\n"
+        for piece in ["hello ", "world", " ", "from ", "SSE"]:
+            yield f"data: {{\"content\": \"{piece}\"}}\n\n"
+            await asyncio.sleep(0.2)
+        yield "data: [DONE]\n\n"
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
