@@ -225,6 +225,8 @@ class UpdateTextRequest(BaseModel):
     # 可选切块参数（不传则使用环境）
     chunk_size: Optional[int] = None
     chunk_overlap: Optional[int] = None
+    # 强制重新索引，即使内容相同（默认false）
+    force_reindex: Optional[bool] = False
 
 
 @router.put("/ingest/text/{document_id}")
@@ -298,6 +300,49 @@ async def update_text_document(
         if not raw_text:
             raise HTTPException(status_code=400, detail="Content is empty")
 
+        # 检查内容是否真正发生了变化
+        current_doc_result = db.execute(sql_text("SELECT content FROM documents WHERE id = :id"), 
+                                       {"id": int(document_id)}).fetchone()
+        
+        content_changed = True
+        skip_reindexing = False
+        
+        if current_doc_result and current_doc_result.content:
+            try:
+                current_content_json = json.loads(current_doc_result.content) if isinstance(current_doc_result.content, str) else current_doc_result.content
+                # 深度比较内容JSON，忽略顺序差异
+                import hashlib
+                current_content_hash = hashlib.md5(json.dumps(current_content_json, sort_keys=True).encode()).hexdigest()
+                new_content_hash = hashlib.md5(json.dumps(content_json, sort_keys=True).encode()).hexdigest()
+                
+                if current_content_hash == new_content_hash:
+                    content_changed = False
+                    # 如果内容没变且标题也没变，且未强制重新索引，则完全跳过处理
+                    if not (payload.title is not None and payload.title != doc_exist.title) and not payload.force_reindex:
+                        skip_reindexing = True
+                    
+            except Exception as e:
+                # JSON解析失败或其他异常，继续正常流程
+                print(f"Content comparison failed, proceeding with update: {e}")
+                content_changed = True
+
+        # 如果内容和标题都没变化，返回现有统计
+        if skip_reindexing:
+            row = db.execute(sql_text(
+                "SELECT COUNT(*) AS cnt, COALESCE(SUM(token_count),0) AS total FROM doc_chunks WHERE document_id = :id"
+            ), {"id": int(document_id)}).fetchone()
+            
+            return {
+                "success": True,
+                "message": "No changes detected, skipped re-indexing",
+                "document_id": int(document_id),
+                "title": doc_exist.title,
+                "chunks_count": int(row.cnt) if row and hasattr(row, 'cnt') else 0,
+                "total_tokens": int(row.total) if row and hasattr(row, 'total') else 0,
+                "content_changed": False,
+                "reindexed": False
+            }
+
         # 更新标题与内容
         # 计算标题与 slug（不主动覆盖旧标题，除非显式传入）
         title_changed = payload.title is not None
@@ -326,6 +371,23 @@ async def update_text_document(
             "id": int(document_id)
         })
         db.commit()
+
+        # 如果内容没有变化且未强制重新索引，只更新文档元数据，不重新索引
+        if not content_changed and not payload.force_reindex:
+            row = db.execute(sql_text(
+                "SELECT COUNT(*) AS cnt, COALESCE(SUM(token_count),0) AS total FROM doc_chunks WHERE document_id = :id"
+            ), {"id": int(document_id)}).fetchone()
+            
+            return {
+                "success": True,
+                "message": "Document updated successfully (content unchanged, skipped re-indexing)",
+                "document_id": int(document_id),
+                "title": new_title,
+                "chunks_count": int(row.cnt) if row and hasattr(row, 'cnt') else 0,
+                "total_tokens": int(row.total) if row and hasattr(row, 'total') else 0,
+                "content_changed": False,
+                "reindexed": False
+            }
 
         # 删除旧的向量与 chunks
         try:
@@ -381,7 +443,9 @@ async def update_text_document(
             "document_id": int(document_id),
             "title": new_title,
             "chunks_count": len(chunks),
-            "total_tokens": sum(token_len(chunk) for chunk in chunks)
+            "total_tokens": sum(token_len(chunk) for chunk in chunks),
+            "content_changed": True,
+            "reindexed": True
         }
     except HTTPException:
         raise
