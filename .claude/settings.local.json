@@ -7,7 +7,8 @@
       "Bash(python test:*)",
       "Bash(export TEST_MODE=true)",
       "Bash(uvicorn:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(mkdir:*)"
     ],
     "deny": [],
     "ask": []

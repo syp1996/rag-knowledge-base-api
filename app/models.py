@@ -1,5 +1,5 @@
 # app/models.py
-from sqlalchemy import Column, Integer, BigInteger, String, Boolean, DateTime, Text, JSON, ForeignKey, Index
+from sqlalchemy import Column, Integer, BigInteger, String, Boolean, DateTime, Text, JSON, ForeignKey, Index, Computed
 from sqlalchemy.sql import func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, deferred
@@ -51,7 +51,7 @@ class Document(Base):
     title = Column(String(255), nullable=False, comment="冗余字段，需与content中的H1标题同步")
     excerpt = Column(String(500), comment="冗余字段，自动从content中提取的文本摘要")
     content = Column(JSON, comment="存储文档内容的块结构JSON对象")
-    content_text = deferred(Column(Text, comment="从content JSON中提取的文本内容，用于全文搜索（生成列）"))
+    content_text = deferred(Column(Text, Computed("CASE WHEN JSON_VALID(content) AND JSON_EXTRACT(content, '$.markdown') IS NOT NULL THEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.markdown')) WHEN JSON_VALID(content) AND JSON_EXTRACT(content, '$.html') IS NOT NULL THEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.html')) ELSE NULL END"), comment="从content JSON中提取的文本内容，用于全文搜索（生成列）"))
     slug = Column(String(255), unique=True)
     status = Column(Integer, default=0, comment="0:draft, 1:published, 2:archived")
     is_pinned = Column(Boolean, default=False)

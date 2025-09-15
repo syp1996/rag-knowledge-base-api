@@ -14,6 +14,7 @@ except Exception as e:
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from .ingest import router as ingest_router
 from .search import router as search_router
 from .ask import router as ask_router
@@ -22,6 +23,7 @@ from .api.auth import router as auth_router
 from .api.users import router as users_router
 from .api.categories import router as categories_router
 from .api.documents import router as documents_router
+from .api.images import router as images_router
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -52,6 +54,10 @@ app.include_router(auth_router, prefix="/api/auth", tags=["认证"])
 app.include_router(users_router, prefix="/api/users", tags=["用户管理"])
 app.include_router(categories_router, prefix="/api/categories", tags=["分类管理"])
 app.include_router(documents_router, prefix="/api/documents", tags=["文档管理"])
+app.include_router(images_router, prefix="/images", tags=["图片管理"])
+
+# Static file serving for uploaded images
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # 健康检查
 @app.get("/", tags=["健康检查"])

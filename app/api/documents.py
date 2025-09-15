@@ -102,6 +102,73 @@ async def create_document(
     
     return db_document
 
+@router.get("/search", response_model=SearchResult)
+async def search_documents(
+    keyword: str = Query(..., description="搜索关键词"),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(10, ge=1, le=100),
+    search_mode: str = Query("fulltext", description="搜索模式: fulltext 或 basic"),
+    highlight: bool = Query(True, description="是否高亮显示"),
+    db: Session = Depends(get_db)
+):
+    """文档搜索"""
+    offset = (page - 1) * per_page
+    
+    # 基础查询（只搜索已发布且未删除的文档）
+    base_query = db.query(Document).filter(
+        Document.status == 1,  # 已发布
+        Document.deleted_at.is_(None)  # 未删除
+    )
+    
+    if search_mode == "fulltext":
+        # 全文搜索（MySQL FULLTEXT，需要先创建索引）
+        try:
+            # 使用MATCH AGAINST进行全文搜索
+            search_query = base_query.filter(
+                text("MATCH(content_text) AGAINST(:keyword IN NATURAL LANGUAGE MODE)")
+            ).params(keyword=keyword)
+            
+            # 按相关度排序
+            search_query = search_query.order_by(
+                text("MATCH(content_text) AGAINST(:keyword IN NATURAL LANGUAGE MODE) DESC")
+            ).params(keyword=keyword)
+            
+        except Exception:
+            # 如果全文搜索失败，回退到基础搜索
+            search_mode = "basic"
+    
+    if search_mode == "basic":
+        # 基础LIKE搜索
+        search_pattern = f"%{keyword}%"
+        search_query = base_query.filter(
+            or_(
+                Document.title.like(search_pattern),
+                Document.content_text.like(search_pattern),
+                Document.excerpt.like(search_pattern)
+            )
+        ).order_by(Document.is_pinned.desc(), Document.created_at.desc())
+    
+    # 获取总数
+    total = search_query.count()
+    
+    # 分页
+    documents = search_query.offset(offset).limit(per_page).all()
+    
+    # 高亮处理
+    if highlight:
+        for doc in documents:
+            if doc.excerpt:
+                doc.excerpt = highlight_search_text(doc.excerpt, keyword)
+    
+    return SearchResult(
+        documents=documents,
+        total=total,
+        page=page,
+        per_page=per_page,
+        keyword=keyword,
+        search_mode=search_mode
+    )
+
 @router.get("/{document_id}", response_model=DocumentSchema)
 async def get_document(
     document_id: int,
@@ -233,73 +300,6 @@ async def pin_document(
     db.refresh(document)
     
     return document
-
-@router.get("/search", response_model=SearchResult)
-async def search_documents(
-    keyword: str = Query(..., description="搜索关键词"),
-    page: int = Query(1, ge=1),
-    per_page: int = Query(10, ge=1, le=100),
-    search_mode: str = Query("fulltext", description="搜索模式: fulltext 或 basic"),
-    highlight: bool = Query(True, description="是否高亮显示"),
-    db: Session = Depends(get_db)
-):
-    """文档搜索"""
-    offset = (page - 1) * per_page
-    
-    # 基础查询（只搜索已发布且未删除的文档）
-    base_query = db.query(Document).filter(
-        Document.status == 1,  # 已发布
-        Document.deleted_at.is_(None)  # 未删除
-    )
-    
-    if search_mode == "fulltext":
-        # 全文搜索（MySQL FULLTEXT，需要先创建索引）
-        try:
-            # 使用MATCH AGAINST进行全文搜索
-            search_query = base_query.filter(
-                text("MATCH(content_text) AGAINST(:keyword IN NATURAL LANGUAGE MODE)")
-            ).params(keyword=keyword)
-            
-            # 按相关度排序
-            search_query = search_query.order_by(
-                text("MATCH(content_text) AGAINST(:keyword IN NATURAL LANGUAGE MODE) DESC")
-            ).params(keyword=keyword)
-            
-        except Exception:
-            # 如果全文搜索失败，回退到基础搜索
-            search_mode = "basic"
-    
-    if search_mode == "basic":
-        # 基础LIKE搜索
-        search_pattern = f"%{keyword}%"
-        search_query = base_query.filter(
-            or_(
-                Document.title.like(search_pattern),
-                Document.content_text.like(search_pattern),
-                Document.excerpt.like(search_pattern)
-            )
-        ).order_by(Document.is_pinned.desc(), Document.created_at.desc())
-    
-    # 获取总数
-    total = search_query.count()
-    
-    # 分页
-    documents = search_query.offset(offset).limit(per_page).all()
-    
-    # 高亮处理
-    if highlight:
-        for doc in documents:
-            if doc.excerpt:
-                doc.excerpt = highlight_search_text(doc.excerpt, keyword)
-    
-    return SearchResult(
-        documents=documents,
-        total=total,
-        page=page,
-        per_page=per_page,
-        keyword=keyword,
-        search_mode=search_mode
-    )
 
 @router.post("/upload", response_model=DocumentSchema)
 async def upload_document(
