@@ -53,8 +53,8 @@ async def ingest_test_documents():
             
             # Insert document into database
             doc_result = db.execute(text("""
-                INSERT INTO documents(user_id, title, content, status, is_pinned, created_at, updated_at, tags_json)
-                VALUES (1, :title, :content, 1, 0, NOW(), NOW(), :tags)
+                INSERT INTO documents(user_id, title, content, is_pinned, created_at, updated_at, tags_json)
+                VALUES (1, :title, :content, 0, NOW(), NOW(), :tags)
             """), {
                 "title": filename.replace('.md', ''),
                 "content": json.dumps({"text": content}),

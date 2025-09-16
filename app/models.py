@@ -53,11 +53,9 @@ class Document(Base):
     content = Column(JSON, comment="存储文档内容的块结构JSON对象")
     content_text = deferred(Column(Text, Computed("CASE WHEN JSON_VALID(content) AND JSON_EXTRACT(content, '$.markdown') IS NOT NULL THEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.markdown')) WHEN JSON_VALID(content) AND JSON_EXTRACT(content, '$.html') IS NOT NULL THEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.html')) ELSE NULL END"), comment="从content JSON中提取的文本内容，用于全文搜索（生成列）"))
     slug = Column(String(255), unique=True)
-    status = Column(Integer, default=0, comment="0:draft, 1:published, 2:archived")
     is_pinned = Column(Boolean, default=False)
     created_at = Column(DateTime, default=func.current_timestamp())
     updated_at = Column(DateTime, default=func.current_timestamp(), onupdate=func.current_timestamp())
-    deleted_at = Column(DateTime)
     
     # 关系
     user = relationship("User", back_populates="documents")
@@ -65,7 +63,7 @@ class Document(Base):
     
     # 索引
     __table_args__ = (
-        Index('idx_user_id_status', 'user_id', 'status'),
+        Index('idx_user_id', 'user_id'),
         Index('idx_category_id', 'category_id'),
         Index('idx_slug', 'slug'),
         Index('idx_created_at', 'created_at'),

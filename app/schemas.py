@@ -64,7 +64,6 @@ class DocumentBase(BaseModel):
     title: str
     content: Optional[dict] = None
     category_id: Optional[int] = None
-    status: Optional[int] = 0
 
 class DocumentCreate(DocumentBase):
     pass
@@ -73,7 +72,6 @@ class DocumentUpdate(BaseModel):
     title: Optional[str] = None
     content: Optional[dict] = None
     category_id: Optional[int] = None
-    status: Optional[int] = None
 
 class DocumentUpload(BaseModel):
     title: str
@@ -88,7 +86,6 @@ class Document(DocumentBase):
     is_pinned: bool
     created_at: datetime
     updated_at: datetime
-    deleted_at: Optional[datetime] = None
     
     # 关联对象
     user: Optional[User] = None

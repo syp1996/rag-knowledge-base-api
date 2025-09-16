@@ -22,7 +22,7 @@ def main():
     db = SessionLocal()
     try:
         total_chunks = db.execute(sql_text("SELECT COUNT(*) FROM doc_chunks")).scalar()
-        docs = db.execute(sql_text("SELECT COUNT(*) FROM documents WHERE deleted_at IS NULL" )).scalar()
+        docs = db.execute(sql_text("SELECT COUNT(*) FROM documents" )).scalar()
     finally:
         db.close()
     stats = milvus.get_collection_stats("kb_chunks") if milvus else {}

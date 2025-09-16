@@ -157,18 +157,17 @@ async def ingest_text_document(
         slug = generate_unique_slug(db, title)
 
         # 提取摘要（避免触发生成列写入，使用原生SQL插入）
-        temp_doc = Document(user_id=default_user.id, title=title, content={"text": raw_text}, slug=slug, status=0)
+        temp_doc = Document(user_id=default_user.id, title=title, content={"text": raw_text}, slug=slug)
         excerpt = temp_doc.extract_excerpt() if hasattr(temp_doc, 'extract_excerpt') else None
 
         result = db.execute(sql_text("""
-            INSERT INTO documents(user_id, title, content, slug, status, excerpt)
-            VALUES (:user_id, :title, :content, :slug, :status, :excerpt)
+            INSERT INTO documents(user_id, title, content, slug, excerpt)
+            VALUES (:user_id, :title, :content, :slug, :excerpt)
         """), {
             "user_id": int(default_user.id),
             "title": title,
             "content": json.dumps(content_json),
             "slug": slug,
-            "status": 0,
             "excerpt": excerpt
         })
         db.commit()
@@ -467,7 +466,7 @@ async def ingest_status(
     try:
         # 获取文档列表
         docs = db.execute(sql_text("""
-            SELECT id, title FROM documents WHERE deleted_at IS NULL ORDER BY created_at DESC
+            SELECT id, title FROM documents ORDER BY created_at DESC
         """)).fetchall()
 
         items = []
@@ -559,7 +558,7 @@ async def reindex_missing(
     try:
         # 获取候选文档（按创建时间倒序）
         rows = db.execute(sql_text(
-            "SELECT id, title, content FROM documents WHERE deleted_at IS NULL ORDER BY created_at DESC"
+            "SELECT id, title, content FROM documents ORDER BY created_at DESC"
         )).fetchall()
 
         candidates = []

@@ -11,10 +11,8 @@
 - ✅ 用户资料管理
 
 ### 2. 文档管理系统
-- ✅ 文档增删查改
-- ✅ 文档发布/草稿状态管理
+- ✅ 文档增删查改（删除为硬删除，直接从数据库移除并同步清理向量）
 - ✅ 文档置顶功能
-- ✅ 软删除机制
 - ✅ 文档搜索（全文搜索 + 基础搜索）
 - ✅ Markdown文件上传
 - ✅ Chrome插件支持
@@ -64,11 +62,9 @@ CREATE TABLE documents (
     content JSON,
     content_text LONGTEXT,
     slug VARCHAR(255) UNIQUE,
-    status INT DEFAULT 0,  -- 0:draft, 1:published, 2:archived
     is_pinned BOOLEAN DEFAULT FALSE,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    deleted_at DATETIME,
     -- 外键和索引
     FOREIGN KEY (user_id) REFERENCES users(id),
     FOREIGN KEY (category_id) REFERENCES categories(id)
@@ -114,8 +110,7 @@ python run.py
 - **POST** `/api/documents/` - 创建文档
 - **GET** `/api/documents/{id}` - 获取单个文档
 - **PUT** `/api/documents/{id}` - 更新文档
-- **DELETE** `/api/documents/{id}` - 删除文档（软删除）
-- **POST** `/api/documents/{id}/publish` - 发布文档
+- **DELETE** `/api/documents/{id}` - 删除文档（硬删除：移除数据库并清理 Milvus 向量）
 - **POST** `/api/documents/{id}/pin` - 置顶文档
 - **GET** `/api/documents/search` - 搜索文档
 - **POST** `/api/documents/upload` - 上传Markdown文件
@@ -259,17 +254,13 @@ doc_data = {
     "content": {
         "markdown": "# 标题\n\n这是文档内容..."
     },
-    "category_id": 1,
-    "status": 0  # 草稿
+    "category_id": 1
 }
 
 response = requests.post("http://localhost:8000/api/documents/", json=doc_data)
 doc_id = response.json()["id"]
 
-# 发布文档
-requests.post(f"http://localhost:8000/api/documents/{doc_id}/publish")
-
-# 搜索文档
+# 搜索文档（全文 / 基础）
 search_result = requests.get(
     "http://localhost:8000/api/documents/search",
     params={"keyword": "标题", "search_mode": "fulltext"}

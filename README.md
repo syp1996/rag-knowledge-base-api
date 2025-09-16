@@ -122,6 +122,10 @@ curl -X POST "http://localhost:8000/api/v1/search/hybrid" \
   }'
 ```
 
+### 删除策略
+
+- 删除为硬删除：调用文档删除接口会同步从 Milvus 移除对应向量，并从 MySQL 物理删除记录（无软删除）。
+
 ## 🔧 技术细节
 
 ### 数据库表结构

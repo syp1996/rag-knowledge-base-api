@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import text as sql_text
 from .deps import get_db, get_milvus
+from .utils import highlight_search_text
 from .embedding import embed_query
 from .rerank import rerank_texts
 from typing import List, Optional, Dict, Any
@@ -13,6 +14,10 @@ router = APIRouter()
 
 class SearchRequest(BaseModel):
     query: str = Field(..., description="搜索查询文本")  # 必填查询词
+    engine: str = Field(
+        default="keyword",
+        description="检索引擎：keyword（Notion式全文）、vector、hybrid"
+    )
     top_k: int = Field(
         default=8, ge=1, le=50,
         description="返回结果数量（更大→覆盖更广但可能包含低质结果）"
@@ -68,28 +73,118 @@ async def search_documents(
     milvus_client = Depends(get_milvus)
 ):
     """
-    语义检索：使用IVF_FLAT索引和COSINE距离进行向量搜索
+    支持三种检索：
+      - keyword（默认，Notion式全文检索，倒排索引、多字段加权、无向量依赖）
+      - vector（语义检索，Milvus 向量召回）
+      - hybrid（混合检索，向量 + FULLTEXT 补充）
     """
     try:
         # 根据多样化需求，获取更多候选以便后续筛选
         import time
         start_time = time.time()
-        
+        # Engine dispatch
+        if (req.engine or "keyword").lower() == "keyword":
+            # Notion式全文检索（无向量依赖）
+            # - 多字段加权：title / excerpt / content_text（documents）+ content（doc_chunks）
+            # - 仅搜索已发布且未删除文档
+            # - 可按 doc_ids 限定范围
+            params = {"q": req.query, "limit": req.top_k}
+            where_doc_ids = ""
+            if req.doc_ids:
+                ids = ",".join(map(str, req.doc_ids))
+                where_doc_ids = f" AND c.document_id IN ({ids}) "
+
+            sql = sql_text(
+                f"""
+                SELECT 
+                  d.id AS doc_id,
+                  d.title AS title,
+                  c.chunk_index AS chunk_index,
+                  c.content AS content,
+                  (
+                    2.0 * MATCH(d.title) AGAINST(:q IN NATURAL LANGUAGE MODE) +
+                    1.0 * MATCH(d.excerpt) AGAINST(:q IN NATURAL LANGUAGE MODE) +
+                    0.75 * MATCH(d.content_text) AGAINST(:q IN NATURAL LANGUAGE MODE) +
+                    0.5 * MATCH(c.content) AGAINST(:q IN NATURAL LANGUAGE MODE)
+                  ) AS score
+                FROM doc_chunks c
+                JOIN documents d ON d.id = c.document_id
+                WHERE 1=1
+                  {where_doc_ids}
+                  AND (
+                    MATCH(d.title) AGAINST(:q IN NATURAL LANGUAGE MODE) OR
+                    MATCH(d.excerpt) AGAINST(:q IN NATURAL LANGUAGE MODE) OR
+                    MATCH(d.content_text) AGAINST(:q IN NATURAL LANGUAGE MODE) OR
+                    MATCH(c.content) AGAINST(:q IN NATURAL LANGUAGE MODE)
+                  )
+                ORDER BY score DESC, d.is_pinned DESC, d.created_at DESC
+                LIMIT :limit
+                """
+            )
+            try:
+                rows = db.execute(sql, params).fetchall()
+            except Exception as e:
+                # 兼容性降级：部分环境 documents 上未建 FULLTEXT，回退为 chunks-only 的全文检索
+                print(f"[keyword-search] falling back to chunks-only FULLTEXT due to: {e}")
+                fallback_sql = f"""
+                    SELECT 
+                      d.id AS doc_id,
+                      d.title AS title,
+                      c.chunk_index AS chunk_index,
+                      c.content AS content,
+                      MATCH(c.content) AGAINST(:q IN NATURAL LANGUAGE MODE) AS score
+                    FROM doc_chunks c
+                    JOIN documents d ON d.id = c.document_id
+                    WHERE 1=1
+                      {where_doc_ids}
+                      AND MATCH(c.content) AGAINST(:q IN NATURAL LANGUAGE MODE)
+                    ORDER BY score DESC, d.is_pinned DESC, d.created_at DESC
+                    LIMIT :limit
+                """
+                rows = db.execute(sql_text(fallback_sql), params).fetchall()
+
+            results: List[SearchResult] = []
+            for r in rows:
+                txt = r.content or ""
+                preview = txt[:200] + "..." if len(txt) > 200 else txt
+                # 高亮仅作用于预览（不修改原文）
+                try:
+                    preview = highlight_search_text(preview, req.query)
+                except Exception:
+                    pass
+                results.append(SearchResult(
+                    doc_id=int(r.doc_id),
+                    chunk_index=int(r.chunk_index),
+                    score=float(r.score) if r.score is not None else 0.0,
+                    title=r.title or "",
+                    content=txt,
+                    preview=preview,
+                    metadata={"search_type": "keyword"}
+                ))
+
+            return SearchResponse(
+                query=req.query,
+                total_hits=len(results),
+                results=results,
+                search_time_ms=round((time.time() - start_time) * 1000, 2)
+            )
+
+        # ===== Vector engine (original flow) =====
         # 1. 生成查询向量
         query_vector = await embed_query(req.query)
-        
+
         # 2. 构建Milvus搜索表达式
         search_filter = None
         if req.doc_ids:
             doc_ids_str = ",".join(map(str, req.doc_ids))
             search_filter = f"doc_id in [{doc_ids_str}]"
-        
+
         # 3. 执行向量搜索
         search_params = {
-            "metric_type": "COSINE", 
+            "metric_type": "COSINE",
             "params": {"nprobe": req.nprobe}
         }
-        
+
         # 如果需要多样化/重排，获取更多候选结果
         multiplier = 1
         if req.rerank:
@@ -97,7 +192,7 @@ async def search_documents(
         if req.mmr:
             multiplier = max(multiplier, 3)
         search_limit = req.top_k * multiplier
-        
+
         hits = milvus_client.search(
             collection_name="kb_chunks",
             data=[query_vector],
@@ -107,13 +202,13 @@ async def search_documents(
             output_fields=["doc_id", "chunk_index", "text"],
             filter=search_filter
         )[0]
-        
+
         # 4. 过滤低分结果
         filtered_hits = [
-            h for h in hits 
+            h for h in hits
             if h["distance"] >= req.score_threshold
         ]
-        
+
         if not filtered_hits:
             return SearchResponse(
                 query=req.query,
@@ -121,27 +216,27 @@ async def search_documents(
                 results=[],
                 search_time_ms=round((time.time() - start_time) * 1000, 2)
             )
-        
+
         # 5. 获取对应的MySQL完整内容
         doc_chunk_pairs = [
             (h["entity"]["doc_id"], h["entity"]["chunk_index"]) 
             for h in filtered_hits
         ]
-        
+
         # 构建SQL IN子句
         pairs_str = ",".join([f"({doc_id},{chunk_idx})" for doc_id, chunk_idx in doc_chunk_pairs])
-        
+
         mysql_result = db.execute(sql_text(f"""
             SELECT d.id, d.title, d.tags_json,
                    c.document_id, c.chunk_index, c.content, c.metadata
             FROM doc_chunks c
             JOIN documents d ON d.id = c.document_id
             WHERE (c.document_id, c.chunk_index) IN ({pairs_str})
-        """))
-        
+        """)).fetchall()
+
         # 创建MySQL数据的索引
         mysql_data = {}
-        for row in mysql_result.fetchall():
+        for row in mysql_result:
             key = (row.document_id, row.chunk_index)
             mysql_data[key] = {
                 "title": row.title,
@@ -149,16 +244,16 @@ async def search_documents(
                 "tags_json": row.tags_json,
                 "metadata": json.loads(row.metadata) if row.metadata else None
             }
-        
+
         # 6. 组合结果
         results = []
         for hit in filtered_hits:
             doc_id = hit["entity"]["doc_id"]
             chunk_index = hit["entity"]["chunk_index"]
             key = (doc_id, chunk_index)
-            
+
             mysql_info = mysql_data.get(key, {})
-            
+
             result = SearchResult(
                 doc_id=doc_id,
                 chunk_index=chunk_index,
@@ -169,7 +264,7 @@ async def search_documents(
                 metadata=mysql_info.get("metadata")
             )
             results.append(result)
-        
+
         # 7. 可选：重排序（基于外部Rerank服务，如阿里云百炼/DashScope）
         if req.rerank and results:
             try:
@@ -185,7 +280,7 @@ async def search_documents(
             except Exception as e:
                 # 保底不影响主流程
                 print(f"Rerank failed: {e}")
-        
+
         # 8. 结果多样化与去冗处理（两阶段：先保底覆盖不同文档，再按分数补齐）
         def diversify(results: List[SearchResult], top_k: int, per_doc_max: Optional[int], mmr: bool, min_unique_docs: Optional[int]) -> List[SearchResult]:
             if not results:
@@ -270,8 +365,13 @@ async def hybrid_search(
     混合检索：结合向量搜索和全文搜索
     """
     try:
-        # 1. 向量搜索
-        vector_results = await search_documents(req, db, milvus_client)
+        # 1. 向量搜索（强制使用 vector 引擎）
+        try:
+            new_req_data = req.model_dump()
+        except Exception:
+            new_req_data = req.dict()  # pydantic v1 fallback
+        new_req_data["engine"] = "vector"
+        vector_results = await search_documents(SearchRequest(**new_req_data), db, milvus_client)
         
         # 2. MySQL全文搜索（作为补充）
         # 放大 FULLTEXT 候选以利于多样化

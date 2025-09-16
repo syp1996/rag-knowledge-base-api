@@ -7,7 +7,7 @@ from datetime import datetime
 import json
 import re
 
-from ..deps import get_db
+from ..deps import get_db, get_milvus
 from ..models import Document, User, Category
 from ..schemas import (
     Document as DocumentSchema,
@@ -27,24 +27,119 @@ from ..utils import (
     highlight_search_text,
     extract_title_from_content
 )
+from ..ingest import _env_chunk_params, _make_splitter, embed_in_batches, token_len, truncate_utf8_bytes
+from ..embedding import embed_texts
 
 router = APIRouter()
+
+
+# --- Helpers: reindex a document into doc_chunks + Milvus ---
+async def _reindex_document(
+    *,
+    db: Session,
+    milvus_client,
+    document_id: int,
+    content_obj: dict | None,
+):
+    """Split, embed and (re)index a document's content into Milvus and doc_chunks.
+
+    - Deletes previous vectors/chunks for the doc
+    - Splits using configured chunk params
+    - Embeds in batches
+    - Inserts to Milvus and doc_chunks
+    """
+    # Extract raw text from content_obj
+    import re
+    raw_text = ""
+    if content_obj:
+        if isinstance(content_obj, dict):
+            if content_obj.get("markdown"):
+                raw_text = str(content_obj.get("markdown") or "").strip()
+            elif content_obj.get("text"):
+                raw_text = str(content_obj.get("text") or "").strip()
+            elif content_obj.get("html"):
+                raw_text = re.sub(r"<[^>]+>", "", str(content_obj.get("html") or "")) or ""
+                raw_text = raw_text.strip()
+        else:
+            raw_text = str(content_obj).strip()
+
+    if not raw_text:
+        # Nothing to index; clean existing if any
+        try:
+            milvus_client.delete(collection_name="kb_chunks", filter=f"doc_id == {int(document_id)}")
+        except Exception:
+            pass
+        db.execute(text("DELETE FROM doc_chunks WHERE document_id = :id"), {"id": int(document_id)})
+        db.commit()
+        return {"chunks": 0, "tokens": 0}
+
+    # Chunking
+    size, overlap = _env_chunk_params()
+    splitter = _make_splitter(size, overlap)
+    chunks = splitter.split_text(raw_text)
+    if not chunks:
+        # Clean existing and return
+        try:
+            milvus_client.delete(collection_name="kb_chunks", filter=f"doc_id == {int(document_id)}")
+        except Exception:
+            pass
+        db.execute(text("DELETE FROM doc_chunks WHERE document_id = :id"), {"id": int(document_id)})
+        db.commit()
+        return {"chunks": 0, "tokens": 0}
+
+    # Embeddings
+    vectors = await embed_in_batches(chunks, batch_size=10, delay=0.3)
+
+    # Remove previous entries
+    try:
+        milvus_client.delete(collection_name="kb_chunks", filter=f"doc_id == {int(document_id)}")
+        milvus_client.flush("kb_chunks")
+    except Exception:
+        pass
+    db.execute(text("DELETE FROM doc_chunks WHERE document_id = :id"), {"id": int(document_id)})
+
+    # Insert new vectors
+    milvus_rows = []
+    for i, (content, vec) in enumerate(zip(chunks, vectors)):
+        milvus_rows.append({
+            "doc_id": int(document_id),
+            "chunk_index": i,
+            "text": truncate_utf8_bytes(content, 1000),
+            "vector": vec
+        })
+    insert_result = milvus_client.insert(collection_name="kb_chunks", data=milvus_rows)
+    milvus_client.flush("kb_chunks")
+    milvus_pks = insert_result.primary_keys if hasattr(insert_result, 'primary_keys') else []
+
+    # Insert doc_chunks
+    for i, content in enumerate(chunks):
+        milvus_pk = milvus_pks[i] if i < len(milvus_pks) else None
+        db.execute(text(
+            """
+            INSERT INTO doc_chunks(document_id, chunk_index, content, token_count, milvus_pk)
+            VALUES (:doc_id, :chunk_index, :content, :token_count, :milvus_pk)
+            """
+        ), {
+            "doc_id": int(document_id),
+            "chunk_index": i,
+            "content": content,
+            "token_count": token_len(content),
+            "milvus_pk": milvus_pk
+        })
+
+    db.commit()
+    return {"chunks": len(chunks), "tokens": sum(token_len(c) for c in chunks)}
 
 @router.get("/", response_model=DocumentList)
 async def get_documents(
     page: int = Query(1, ge=1),
     per_page: int = Query(10, ge=1, le=100),
-    status: Optional[int] = Query(None, description="文档状态过滤"),
     category_id: Optional[int] = Query(None, description="分类过滤"),
     db: Session = Depends(get_db)
 ):
     """获取文档列表（不分页，返回全部）"""
-    # 基础查询（过滤软删除）
-    query = db.query(Document).filter(Document.deleted_at.is_(None))
-    
-    # 状态过滤
-    if status is not None:
-        query = query.filter(Document.status == status)
+    # 基础查询（返回全部未物理删除的文档）
+    query = db.query(Document)
     
     # 分类过滤
     if category_id is not None:
@@ -68,7 +163,8 @@ async def get_documents(
 @router.post("/", response_model=DocumentSchema)
 async def create_document(
     document: DocumentCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    milvus_client = Depends(get_milvus)
 ):
     """创建文档（无需认证，使用默认用户）"""
     # 获取或创建默认用户
@@ -88,8 +184,7 @@ async def create_document(
         category_id=document.category_id,
         title=title,
         content=document.content,
-        slug=slug,
-        status=document.status or 0
+        slug=slug
     )
     
     # 提取摘要
@@ -99,6 +194,13 @@ async def create_document(
     db.add(db_document)
     db.commit()
     db.refresh(db_document)
+
+    # Reindex content so it’s searchable immediately
+    try:
+        await _reindex_document(db=db, milvus_client=milvus_client, document_id=int(db_document.id), content_obj=db_document.content)
+    except Exception as e:
+        # Do not fail creation due to indexing
+        print(f"[create_document] Reindex failed for doc {db_document.id}: {e}")
     
     return db_document
 
@@ -111,62 +213,58 @@ async def search_documents(
     highlight: bool = Query(True, description="是否高亮显示"),
     db: Session = Depends(get_db)
 ):
-    """文档搜索"""
+    """文档搜索（未删除的全部文档；默认 FULLTEXT，索引缺失自动回退 LIKE）。"""
     offset = (page - 1) * per_page
-    
-    # 基础查询（只搜索已发布且未删除的文档）
-    base_query = db.query(Document).filter(
-        Document.status == 1,  # 已发布
-        Document.deleted_at.is_(None)  # 未删除
-    )
-    
-    if search_mode == "fulltext":
-        # 全文搜索（MySQL FULLTEXT，需要先创建索引）
+
+    # 搜索全部文档
+    base_query = db.query(Document)
+
+    used_mode = search_mode
+    search_query = None
+    total = 0
+
+    if used_mode == "fulltext":
         try:
-            # 使用MATCH AGAINST进行全文搜索
-            search_query = base_query.filter(
+            q = base_query.filter(
                 text("MATCH(content_text) AGAINST(:keyword IN NATURAL LANGUAGE MODE)")
             ).params(keyword=keyword)
-            
-            # 按相关度排序
-            search_query = search_query.order_by(
+            q = q.order_by(
                 text("MATCH(content_text) AGAINST(:keyword IN NATURAL LANGUAGE MODE) DESC")
             ).params(keyword=keyword)
-            
-        except Exception:
-            # 如果全文搜索失败，回退到基础搜索
-            search_mode = "basic"
-    
-    if search_mode == "basic":
-        # 基础LIKE搜索
-        search_pattern = f"%{keyword}%"
-        search_query = base_query.filter(
+            # 触发执行以便检测索引缺失问题
+            total = q.count()
+            search_query = q
+        except Exception as e:
+            # 索引缺失或不支持，回退到 basic
+            print(f"[/api/documents/search] FULLTEXT unavailable, fallback to LIKE: {e}")
+            used_mode = "basic"
+
+    if used_mode == "basic":
+        pattern = f"%{keyword}%"
+        q = base_query.filter(
             or_(
-                Document.title.like(search_pattern),
-                Document.content_text.like(search_pattern),
-                Document.excerpt.like(search_pattern)
+                Document.title.like(pattern),
+                Document.content_text.like(pattern),
+                Document.excerpt.like(pattern)
             )
         ).order_by(Document.is_pinned.desc(), Document.created_at.desc())
-    
-    # 获取总数
-    total = search_query.count()
-    
-    # 分页
-    documents = search_query.offset(offset).limit(per_page).all()
-    
-    # 高亮处理
+        total = q.count()
+        search_query = q
+
+    documents = search_query.offset(offset).limit(per_page).all() if search_query else []
+
     if highlight:
         for doc in documents:
-            if doc.excerpt:
+            if getattr(doc, "excerpt", None):
                 doc.excerpt = highlight_search_text(doc.excerpt, keyword)
-    
+
     return SearchResult(
         documents=documents,
         total=total,
         page=page,
         per_page=per_page,
         keyword=keyword,
-        search_mode=search_mode
+        search_mode=used_mode
     )
 
 @router.get("/{document_id}", response_model=DocumentSchema)
@@ -175,10 +273,7 @@ async def get_document(
     db: Session = Depends(get_db)
 ):
     """获取单个文档"""
-    document = db.query(Document).filter(
-        Document.id == document_id,
-        Document.deleted_at.is_(None)  # 检查软删除
-    ).first()
+    document = db.query(Document).filter(Document.id == document_id).first()
     
     if not document:
         raise HTTPException(
@@ -192,14 +287,12 @@ async def get_document(
 async def update_document(
     document_id: int,
     document_update: DocumentUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    milvus_client = Depends(get_milvus)
 ):
     """更新文档（无需认证）"""
     # 检查文档存在性和软删除状态
-    document = db.query(Document).filter(
-        Document.id == document_id,
-        Document.deleted_at.is_(None)
-    ).first()
+    document = db.query(Document).filter(Document.id == document_id).first()
     
     if not document:
         raise HTTPException(
@@ -214,68 +307,56 @@ async def update_document(
         document.slug = generate_unique_slug(db, document_update.title, document_id)
     
     # 更新内容
+    content_changed = False
     if document_update.content is not None:
         document.content = document_update.content
         document.excerpt = document.extract_excerpt()
+        content_changed = True
     
     # 更新分类
     if document_update.category_id is not None:
         document.category_id = document_update.category_id
     
-    # 更新状态
-    if document_update.status is not None:
-        document.status = document_update.status
-    
     db.commit()
     db.refresh(document)
+
+    # If content changed, reindex into Milvus + doc_chunks
+    if content_changed:
+        try:
+            await _reindex_document(db=db, milvus_client=milvus_client, document_id=int(document.id), content_obj=document.content)
+        except Exception as e:
+            print(f"[update_document] Reindex failed for doc {document.id}: {e}")
+            # Keep returning the updated document even if indexing fails
     
     return document
 
 @router.delete("/{document_id}", response_model=MessageResponse)
 async def delete_document(
     document_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    milvus_client = Depends(get_milvus)
 ):
-    """删除文档（软删除，无需认证）"""
-    document = db.query(Document).filter(
-        Document.id == document_id,
-        Document.deleted_at.is_(None)
-    ).first()
-    
+    """删除文档（硬删除：同时删除 Milvus 向量与数据库记录）"""
+    # 检查文档是否存在
+    document = db.query(Document).filter(Document.id == document_id).first()
     if not document:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found"
-        )
-    
-    # 软删除
-    document.deleted_at = datetime.utcnow()
-    db.commit()
-    
-    return {"message": "Document deleted successfully"}
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
-@router.post("/{document_id}/publish", response_model=DocumentSchema)
-async def publish_document(
-    document_id: int,
-    db: Session = Depends(get_db)
-):
-    """发布文档"""
-    document = db.query(Document).filter(
-        Document.id == document_id,
-        Document.deleted_at.is_(None)
-    ).first()
-    
-    if not document:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found"
-        )
-    
-    document.status = 1  # 发布状态
+    # 从Milvus删除向量（按doc_id过滤）
+    try:
+        milvus_client.delete(collection_name="kb_chunks", filter=f"doc_id == {int(document_id)}")
+    except Exception as e:
+        # 不中断删除流程，但记录日志
+        print(f"[documents.delete] Milvus delete failed for doc {document_id}: {e}")
+
+    # 从MySQL删除（CASCADE自动删除 doc_chunks）
+    db.execute(text("""
+        DELETE FROM documents WHERE id = :doc_id
+    """), {"doc_id": int(document_id)})
     db.commit()
-    db.refresh(document)
-    
-    return document
+
+    return {"message": f"Document {document_id} deleted successfully"}
+
 
 @router.post("/{document_id}/pin", response_model=DocumentSchema)
 async def pin_document(
@@ -283,10 +364,7 @@ async def pin_document(
     db: Session = Depends(get_db)
 ):
     """置顶/取消置顶文档"""
-    document = db.query(Document).filter(
-        Document.id == document_id,
-        Document.deleted_at.is_(None)
-    ).first()
+    document = db.query(Document).filter(Document.id == document_id).first()
     
     if not document:
         raise HTTPException(
@@ -305,7 +383,8 @@ async def pin_document(
 async def upload_document(
     file: UploadFile = File(...),
     category_id: Optional[int] = Query(None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    milvus_client = Depends(get_milvus)
 ):
     """上传文档"""
     # 检查文件类型
@@ -334,8 +413,7 @@ async def upload_document(
         category_id=category_id,
         title=title,
         content={"markdown": markdown_content},
-        slug=slug,
-        status=0  # 草稿状态
+        slug=slug
     )
     
     # 提取摘要
@@ -344,13 +422,20 @@ async def upload_document(
     db.add(db_document)
     db.commit()
     db.refresh(db_document)
+
+    # Index uploaded content
+    try:
+        await _reindex_document(db=db, milvus_client=milvus_client, document_id=int(db_document.id), content_obj=db_document.content)
+    except Exception as e:
+        print(f"[upload_document] Reindex failed for doc {db_document.id}: {e}")
     
     return db_document
 
 @router.post("/plugin", response_model=DocumentSchema)
 async def create_plugin_document(
     plugin_doc: PluginDocumentCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    milvus_client = Depends(get_milvus)
 ):
     """Chrome插件创建文档（无需认证）"""
     # 获取Chrome插件专用用户
@@ -368,8 +453,7 @@ async def create_plugin_document(
             "html": plugin_doc.content,
             "url": plugin_doc.url
         },
-        slug=slug,
-        status=0  # 草稿状态
+        slug=slug
     )
     
     # 提取摘要
@@ -378,5 +462,11 @@ async def create_plugin_document(
     db.add(db_document)
     db.commit()
     db.refresh(db_document)
+
+    # Index captured page content
+    try:
+        await _reindex_document(db=db, milvus_client=milvus_client, document_id=int(db_document.id), content_obj=db_document.content)
+    except Exception as e:
+        print(f"[create_plugin_document] Reindex failed for doc {db_document.id}: {e}")
     
     return db_document

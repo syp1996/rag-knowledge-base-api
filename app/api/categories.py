@@ -112,8 +112,7 @@ async def delete_category(
     
     # 检查是否有文档使用此分类
     documents_count = db.query(Document).filter(
-        Document.category_id == category_id,
-        Document.deleted_at.is_(None)
+        Document.category_id == category_id
     ).count()
     
     if documents_count > 0:
@@ -134,7 +133,7 @@ async def get_category_documents(
     per_page: int = Query(10, ge=1, le=100),
     db: Session = Depends(get_db)
 ):
-    """获取分类下的文档（只返回已发布的文档）"""
+    """获取分类下的文档（未删除的全部文档）"""
     category = db.query(Category).filter(Category.id == category_id).first()
     if not category:
         raise HTTPException(
@@ -144,11 +143,8 @@ async def get_category_documents(
     
     offset = (page - 1) * per_page
     
-    # 只返回已发布的文档
     documents = db.query(Document).filter(
-        Document.category_id == category_id,
-        Document.status == 1,  # 已发布
-        Document.deleted_at.is_(None)  # 未删除
+        Document.category_id == category_id
     ).order_by(Document.is_pinned.desc(), Document.created_at.desc()).offset(offset).limit(per_page).all()
     
     return documents

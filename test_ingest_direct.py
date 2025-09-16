@@ -46,15 +46,14 @@ async def test_ingest():
         # 插入文档（使用现有表结构，content为JSON字段）
         import json
         doc_result = db.execute(sql_text("""
-            INSERT INTO documents(user_id, title, excerpt, content, tags_json, status, is_pinned)
-            VALUES (:user_id, :title, :excerpt, :content, :tags, :status, :is_pinned)
+            INSERT INTO documents(user_id, title, excerpt, content, tags_json, is_pinned)
+            VALUES (:user_id, :title, :excerpt, :content, :tags, :is_pinned)
         """), {
             "user_id": 1,  # 假设测试用户ID为1
             "title": "Test Document",
             "excerpt": "Test document for RAG system",
             "content": json.dumps({"text": raw_text}),
             "tags": None,
-            "status": 1,
             "is_pinned": 0
         })
         doc_id = doc_result.lastrowid
